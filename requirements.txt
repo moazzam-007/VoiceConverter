@@ -1,0 +1,10 @@
+# For NVIDIA GPU (CUDA 11.8), install torch manually first:
+# pip install torch==2.1.1+cu118 torchaudio==2.1.1+cu118 --index-url https://download.pytorch.org/whl/cu118
+torch==2.1.1
+torchaudio==2.1.1
+rvc-python
+watchdog
+google-api-python-client
+google-auth
+google-auth-httplib2
+ffmpeg-python

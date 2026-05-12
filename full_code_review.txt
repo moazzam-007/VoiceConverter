@@ -1,0 +1,352 @@
+==================================================
+FILE: config.py
+==================================================
+from pathlib import Path
+
+MODEL_PATH = Path("models/female.pth")
+DEVICE = "cuda:0"  # Change to "cpu" if no GPU
+PITCH_SHIFT = 12
+INPUT_FOLDER = Path("input")
+OUTPUT_FOLDER = Path("output")
+
+SERVICE_ACCOUNT_FILE = Path("credentials/service_account.json")
+DRIVE_FOLDER_ID = "REPLACE_WITH_DRIVE_FOLDER_ID"
+
+==================================================
+FILE: converter.py
+==================================================
+import logging
+import time
+from pathlib import Path
+
+import torch
+from rvc_python.infer import RVCInference
+
+
+class VoiceConverter:
+    def __init__(self, model_path: Path, pitch_shift: int, device: str = "cuda:0") -> None:
+        self.model_path = model_path
+        self.pitch_shift = pitch_shift
+        self.device = device
+        self._rvc = self._load_model()
+
+    def _create_rvc(self) -> RVCInference:
+        device = self.device
+        if device.startswith("cuda") and not torch.cuda.is_available():
+            logging.warning("CUDA not available, falling back to CPU.")
+            device = "cpu"
+
+        try:
+            return RVCInference(device=device)
+        except Exception as exc:
+            if device != "cpu":
+                logging.warning("CUDA init failed (%s). Falling back to CPU.", device)
+                try:
+                    return RVCInference(device="cpu")
+                except Exception as cpu_exc:
+                    raise RuntimeError(
+                        "CUDA not available and CPU fallback failed."
+                    ) from cpu_exc
+            raise RuntimeError("Failed to initialize RVC inference.") from exc
+
+    def _load_model(self) -> RVCInference:
+        if not self.model_path.exists():
+            raise FileNotFoundError(f"Model not found: {self.model_path}")
+
+        rvc = self._create_rvc()
+        rvc.load_model(str(self.model_path))
+        logging.info("Model loaded: %s", self.model_path)
+        return rvc
+
+    def convert_file(self, input_path: Path, output_path: Path) -> Path:
+        output_path = output_path.with_suffix(".wav")
+        logging.info("Conversion started: %s", input_path)
+        self._rvc.params["f0_up_key"] = self.pitch_shift
+        start = time.perf_counter()
+
+        try:
+            self._rvc.infer_file(str(input_path), str(output_path))
+        except Exception as exc:
+            raise RuntimeError(f"Conversion failed for {input_path}") from exc
+
+        elapsed = time.perf_counter() - start
+        logging.info("Conversion done: %s (%.2fs)", output_path, elapsed)
+        return output_path
+
+==================================================
+FILE: main.py
+==================================================
+import logging
+import time
+from pathlib import Path
+from typing import Iterable
+
+from watchdog.events import FileSystemEventHandler
+from watchdog.observers import Observer
+
+from config import INPUT_FOLDER, OUTPUT_FOLDER, MODEL_PATH, PITCH_SHIFT, DEVICE
+from converter import VoiceConverter
+from uploader import upload_file
+
+
+ALLOWED_EXTENSIONS = {".wav", ".mp3", ".flac", ".m4a", ".ogg"}
+
+
+def _setup_logging() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(message)s",
+    )
+
+
+def _iter_audio_files(folder: Path) -> Iterable[Path]:
+    for path in folder.iterdir():
+        if path.is_file() and path.suffix.lower() in ALLOWED_EXTENSIONS:
+            yield path
+
+
+def _wait_for_file_ready(path: Path, attempts: int = 10, delay: float = 2.0) -> bool:
+    last_size = -1
+    for _ in range(attempts):
+        if not path.exists():
+            return False
+        size = path.stat().st_size
+        if size > 0 and size == last_size:
+            return True
+        last_size = size
+        time.sleep(delay)
+    return False
+
+
+def _process_file(converter: VoiceConverter, input_path: Path) -> None:
+    if input_path.suffix.lower() not in ALLOWED_EXTENSIONS:
+        return
+
+    if not _wait_for_file_ready(input_path):
+        logging.warning("Skipping unreadable file: %s", input_path)
+        return
+
+    output_path = OUTPUT_FOLDER / (input_path.stem + ".wav")
+    if output_path.exists():
+        logging.info("Output exists, skipping: %s", output_path)
+        return
+
+    converter.convert_file(input_path, output_path)
+    link = upload_file(output_path)
+    logging.info("Shareable link: %s", link)
+
+
+def _process_batch(converter: VoiceConverter) -> None:
+    logging.info("Starting batch processing in %s", INPUT_FOLDER)
+    for audio_file in _iter_audio_files(INPUT_FOLDER):
+        _process_file(converter, audio_file)
+    logging.info("Batch processing complete.")
+
+
+class _InputHandler(FileSystemEventHandler):
+    def __init__(self, converter: VoiceConverter) -> None:
+        self.converter = converter
+
+    def on_created(self, event):
+        if event.is_directory:
+            return
+        _process_file(self.converter, Path(event.src_path))
+
+    def on_moved(self, event):
+        if event.is_directory:
+            return
+        _process_file(self.converter, Path(event.dest_path))
+
+
+def main() -> None:
+    _setup_logging()
+    INPUT_FOLDER.mkdir(parents=True, exist_ok=True)
+    OUTPUT_FOLDER.mkdir(parents=True, exist_ok=True)
+
+    logging.info("Loading RVC model: %s", MODEL_PATH)
+    converter = VoiceConverter(MODEL_PATH, PITCH_SHIFT, DEVICE)
+
+    _process_batch(converter)
+
+    logging.info("Watching input folder for new files...")
+    observer = Observer()
+    observer.schedule(_InputHandler(converter), str(INPUT_FOLDER), recursive=False)
+    observer.start()
+
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        logging.info("Stopping watcher.")
+        observer.stop()
+
+    observer.join()
+
+
+if __name__ == "__main__":
+    main()
+
+==================================================
+FILE: uploader.py
+==================================================
+import logging
+from pathlib import Path
+
+from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
+
+from config import DRIVE_FOLDER_ID, SERVICE_ACCOUNT_FILE
+
+
+SCOPES = ["https://www.googleapis.com/auth/drive"]
+
+
+def _drive_service():
+    if not SERVICE_ACCOUNT_FILE.exists():
+        raise FileNotFoundError(f"Service account file not found: {SERVICE_ACCOUNT_FILE}")
+
+    credentials = Credentials.from_service_account_file(
+        str(SERVICE_ACCOUNT_FILE), scopes=SCOPES
+    )
+    return build("drive", "v3", credentials=credentials)
+
+
+def upload_file(file_path: Path) -> str:
+    logging.info("Uploading to Google Drive: %s", file_path)
+    service = _drive_service()
+
+    metadata = {"name": file_path.name}
+    if DRIVE_FOLDER_ID and DRIVE_FOLDER_ID != "REPLACE_WITH_DRIVE_FOLDER_ID":
+        metadata["parents"] = [DRIVE_FOLDER_ID]
+
+    media = MediaFileUpload(str(file_path), resumable=True)
+    uploaded = (
+        service.files()
+        .create(body=metadata, media_body=media, fields="id,webViewLink")
+        .execute()
+    )
+
+    service.permissions().create(
+        fileId=uploaded["id"],
+        body={"type": "anyone", "role": "reader"},
+    ).execute()
+
+    link = uploaded.get("webViewLink")
+    logging.info("Upload complete. Shareable link: %s", link)
+    return link
+
+==================================================
+FILE: setup_check.py
+==================================================
+from pathlib import Path
+
+
+def _print_issue(message: str) -> None:
+    print(f"- {message}")
+
+
+def main() -> None:
+    issues = []
+
+    models_dir = Path("models")
+    model_file = models_dir / "female.pth"
+    if not models_dir.exists():
+        issues.append("Create the models/ folder and add female.pth.")
+    elif not model_file.exists():
+        issues.append("Place female.pth in models/.")
+
+    creds_file = Path("credentials/service_account.json")
+    if not creds_file.exists():
+        issues.append("Add credentials/service_account.json for Google Drive uploads.")
+
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            gpu_name = torch.cuda.get_device_name(0)
+            print(f"GPU detected: {gpu_name}")
+        else:
+            print("CPU mode (CUDA not available).")
+    except Exception:
+        issues.append("Install torch. Run: pip install -r requirements.txt")
+
+    try:
+        import rvc_python  # noqa: F401
+    except Exception:
+        issues.append("Install rvc-python. Run: pip install -r requirements.txt")
+
+    import subprocess
+    try:
+        result = subprocess.run(["ffmpeg", "-version"], capture_output=True, timeout=5)
+        if result.returncode == 0:
+            print("ffmpeg detected on system.")
+        else:
+            issues.append(
+                "ffmpeg not found. Download from https://ffmpeg.org/download.html and add to PATH."
+            )
+    except FileNotFoundError:
+        issues.append(
+            "ffmpeg not found. Download from https://ffmpeg.org/download.html and add to PATH."
+        )
+    except Exception:
+        issues.append("Could not verify ffmpeg. Make sure it is installed and in PATH.")
+
+    if issues:
+        print("Setup issues found:")
+        for issue in issues:
+            _print_issue(issue)
+        print("Fix the items above, then rerun: python setup_check.py")
+    else:
+        print("✅ All checks passed. Run: python main.py")
+
+
+if __name__ == "__main__":
+    main()
+
+==================================================
+FILE: requirements.txt
+==================================================
+# For NVIDIA GPU (CUDA 11.8), install torch manually first:
+# pip install torch==2.1.1+cu118 torchaudio==2.1.1+cu118 --index-url https://download.pytorch.org/whl/cu118
+torch==2.1.1
+torchaudio==2.1.1
+rvc-python
+watchdog
+google-api-python-client
+google-auth
+google-auth-httplib2
+ffmpeg-python
+
+==================================================
+FILE: README.md
+==================================================
+# Voice Conversion Automation
+
+Fully automated male-to-female voice conversion pipeline.
+
+## Requirements
+
+- Python 3.10
+- NVIDIA GPU recommended
+- ffmpeg installed on the system
+
+## Setup steps
+
+1. Install dependencies:
+	pip install -r requirements.txt
+2. Download a female RVC model (.pth) from AI Hub Discord and place it in models/.
+3. Set up a Google Drive service account and place the JSON in credentials/.
+4. Edit config.py with your DRIVE_FOLDER_ID.
+5. Run the setup check:
+	python setup_check.py
+6. Run the pipeline:
+	python main.py
+
+## How it works
+
+input/ folder -> RVC conversion -> output/ folder -> Google Drive upload -> link printed in logs
+
+## Supported audio formats
+
+wav, mp3, flac, m4a, ogg
